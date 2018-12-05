@@ -1,0 +1,3 @@
+server_list.txt里面只有1行，为首节点的IP和端口。
+首节点启用使用命令：project -enable_server -first_server
+以后只要整个集群拥有一台在线的服务器，就不需要使用-first_server参数。
