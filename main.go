@@ -1,8 +1,5 @@
 /*
 分布式文件共享系统
-
-将数据库由sqlite3换成ql2，保证整个项目为纯go，方便交叉编译。
-
 */
 
 package main
@@ -32,7 +29,6 @@ import (
 
 const ( //定义指令码，数据包第一个字节为指令码
     DOWNLOAD_FILE byte = 1 //下载文件，后面跟文件的key
-    //FILE_SIZE byte = 2 //文件大小，后面跟文件大小（单位Byte）
     LEND_GLOBAL_DB_LOCK byte = 6 //借用全局数据库锁
     RETURN_GLOBAL_DB_LOCK byte = 7 //归还全局数据库锁
     ACK byte = 8 //表示收到信息
@@ -60,8 +56,8 @@ const CLIENT_SHELL_HELP_MSG= //客户端命令行帮助信息
 const FILE_BLOCK_SIZE=1024*1024*32 //文件分块大小，单位Byte
 const FILE_READ_SIZE=1024*1024*2 //读取缓存大小
 const (
-    DB_TYPE="ql2"
-    GLOBAL_DB_PATH="global.db"
+    DB_TYPE="ql2" //数据库类型
+    GLOBAL_DB_PATH="global.db" //数据库路径
 )
 
 /*
@@ -71,7 +67,7 @@ const (
 同步完成后释放分布式锁
 如果要读取数据，需要在没有节点写入数据库的时候读取（如果读取时有节点要申请锁，读取完再给）
 
-TODO：新的数据库结构：服务器加入集群的时候扫描本地文件块，文件块下载完成进行校验，断点续传，迁移等功能
+TODO：删除文件时看看如何清理数据库，文件块下载完成进行校验，断点续传，迁移等功能，相同hash的分块不需要上传/重复删除等
 TABEL key_server
 (
 key char(40),//key，即文件分块名，sha1字符串形式，共40字节
@@ -88,7 +84,7 @@ key char(40),//key，即文件分块名，sha1字符串形式，共40字节
 TABLE file
 (
 filename varchar(255),//文件名
-hash varchar(255),//文件hash，非必须
+//hash varchar(255),//文件hash，非必须
 deleted bool //文件是否已被删除
 )
 */
@@ -96,9 +92,7 @@ deleted bool //文件是否已被删除
 //TODO:美化输出
 
 /*
-高可用
-上传：选最优2个服务器上传
-下载：随机选一个服务器
+TODO：高可用
 掉线服务器数据同步问题：建立长连接，发现自己掉线，重连后更新数据库和服务器列表。
 */
 
@@ -108,6 +102,7 @@ var upload_mission sync.WaitGroup //上传任务的WaitGroup
 var global_server_list [] string //服务器列表，格式如“127.0.0.1::2333”
 var global_db_lock_status int = FREE //全局数据库锁
 var global_server_load uint8 = 0 //服务器负载
+var self_server_addr string
 
 const ( //定义全局数据库锁状态
     FREE = 0 //没有节点在使用全局数据库锁
@@ -143,6 +138,7 @@ func checkErr(err interface{}){
 func main() {
     flag.Parse()//读取命令行参数
     log("enable_server",*enable_server)
+    log("first_server",*first_server)
     log("port",*port)
     log("verbose",*verbose)
 
@@ -154,7 +150,6 @@ func main() {
     //根据参数判断是否作为服务端启动
     if *enable_server {
         fmt.Println("[INFO]系统启动……")
-        go tcpServer(*port)//启动服务器，接收客户端和其它服务器的消息
     }
 
     if !*first_server {
@@ -177,6 +172,7 @@ func main() {
             }
             //加入服务器集群
             if *enable_server {
+                go testConn()//加入集群需启动一个测试连接服务端
                 fmt.Println("[INFO]加入服务器集群……")
                 bytes_buf := bytes.NewBuffer(make([]byte, 0))
                 binary.Write(bytes_buf, binary.BigEndian, JOIN_CLUSTER)//1字节指令码
@@ -187,6 +183,11 @@ func main() {
                 instruct := readInstruct(conn)
                 if instruct==ACK {
                     fmt.Println("[INFO]服务器集群加入成功")
+                    //得到本机ip，更新数据库要用
+                    data := make([]byte, 21)//地址长度最大21：xxx.xxx.xxx.xxx:xxxxx
+                    n, _ :=conn.Read(data)//读取本机地址
+                    self_server_addr=string(data[0:n])
+                    fmt.Println("本机地址：",self_server_addr)
                 }else{
                     fmt.Println("[ERROR]服务器集群加入失败，请检查端口映射")
                     os.Exit(1)
@@ -205,6 +206,7 @@ func main() {
             }
         }
 
+        time.Sleep(time.Millisecond*100)//不等待的话会卡住，不过不是很懂为什么
         fmt.Println("[INFO]更新服务器列表……")
         tcpAddr, err := net.ResolveTCPAddr("tcp", connected_server);checkErr(err)
         conn, err := net.DialTCP("tcp", nil, tcpAddr)
@@ -213,7 +215,7 @@ func main() {
             os.Exit(1)
         }
         sendInstruct(GET_SERVER_LIST,conn)
-        err=reciveFile("server_list.txt",conn)//下载文件
+        err=reciveFile("server_list.txt",conn)//下载文件 TODO: BUG:卡在此处
         if err!=nil {
             fmt.Println("[ERROR]下载文件失败")
             os.Exit(1)
@@ -225,28 +227,51 @@ func main() {
         fmt.Println("[INFO]没有数据库，新建中...")
         db, err := sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)
         tx, err := db.Begin();checkErr(err)
-        _, err = tx.Exec(`CREATE TABLE keys (
+        _, err = tx.Exec(`CREATE TABLE KeyServer (
+        key string,
+        server string,
+        );`);checkErr(err)
+        _, err = tx.Exec(`CREATE TABLE FileKey (
         filename string,
         num int,
         key string,
-        server string
+        );`);checkErr(err)
+        _, err = tx.Exec(`CREATE TABLE File (
+        filename string,
+        deleted int,
         );`);checkErr(err)
         err = tx.Commit();checkErr(err)
         err = db.Close();checkErr(err)
-        /*if err = db.Close(); err != nil {
-            return
-        }*/
-        fmt.Println("[INFO]数据库新建完成...")
+        fmt.Println("[INFO]数据库新建完成。")
       }
       //TODO:加检测数据库里面是否存在数据表的步骤
     }
 
-    if !*first_server {//发布自己存在的块
+    if *enable_server && !*first_server {//扫描本地存储，将已有的块更新到数据库上
         fmt.Println("[INFO]更新数据库文件……")
-        //TODO！！！！！！！！！
+        dir, err := ioutil.ReadDir("storage");checkErr(err)
+        acquireGlobalLock_Write()
+        db, err := sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)
+        for _,f := range dir {
+            //先查询数据库有没有该条目
+            var key string
+            //log(f.Name())
+            db.QueryRow(`SELECT key FROM KeyServer WHERE server = $1 and key = $2`,self_server_addr,f.Name()).Scan(&key);
+            //fmt.Println(f.Name(),key)
+            if key=="" {//如果没有就新增 TODO:根据文件情况决定是否删除
+                log("新增数据块：",f.Name())
+                tx, err := db.Begin();checkErr(err)
+                _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,f.Name(),self_server_addr);checkErr(err)
+                err = tx.Commit();checkErr(err)
+            }
+        }
+        err = db.Close();checkErr(err)
+        syncGlobalDatabase()
+        releaseGlobalLock_Write()
     }
 
     if *enable_server {
+        go tcpServer(*port)//启动服务器，接收客户端和其它服务器的消息
         fmt.Println("[INFO]服务器启动完成。")
     }else{
         go clientShell()//启用客户端命令行
@@ -287,25 +312,10 @@ func clientHandle(conn net.Conn) {//客户端连接处理goroutine，处理客�
     defer fmt.Println("连接断开：",conn.RemoteAddr().String()) //函数结束前输出提示
     //循环的处理客户的请求
     for {
-        //http://blog.sina.com.cn/s/blog_9be3b8f10101lhiq.html
-        //conn.SetReadDeadline(time.Now().Add(time.Second * 150)) //一定时间内客户端无数据发送则关闭连接，这个太小会导致客户端上传到一半中断。TODO：解决会中断到问题。
+        //TODO:处理超时的连接
         //读取数据
         instruct := readInstruct(conn)
         if instruct==255 {break}
-        /*instruct := make([]byte, 1) //初始化缓冲区，1字节
-        _,err:=conn.Read(instruct)
-        if err != nil {break}*/
-        //fmt.Println(n,err)
-        /*for{//不需要，read是阻塞的。
-            n,err:=conn.Read(instruct)
-            fmt.Println(n,err)
-            if(n==0){
-                time.Sleep(time.Millisecond*1000)
-            }else{
-                break
-            }
-        }*/
-        //switch instruct[0] {//根据指令码做出选择
         switch instruct {//根据指令码做出选择
             case DOWNLOAD_FILE://下载文件
                 key:=readKey(conn)//读取文件key
@@ -338,7 +348,7 @@ func clientHandle(conn net.Conn) {//客户端连接处理goroutine，处理客�
                 sendInstruct(ACK,conn)
                 fmt.Println("全局数据库同步完毕")
             case SYNC_SERVER_LIST://同步服务器列表
-                log("[接收到指令]开始同步服务器列表")
+                log("[接收到指令]同步服务器列表")
                 err:=reciveFile("server_list.txt",conn)
                 if err!=nil {
                     fmt.Println("[ERROR]服务器列表同步出错")
@@ -430,10 +440,11 @@ func clientHandle(conn net.Conn) {//客户端连接处理goroutine，处理客�
                     fmt.Println("服务器已在列表中：",server)
                 }
                 sendInstruct(ACK,conn)//返回ACK
-                syncServerList()//向所有节点同步服务器列表
+                conn.Write([]byte(server))
+                syncServerList()//向所有节点同步服务器列表  BUG！和服务器加入集群冲突！！！！
                 refreshServerList()//刷新服务器列表
             case GET_SERVER_LIST:
-                log("[接收到指令]请求同步服务器列表")
+                log("[接收到指令]请求服务器列表")
                 sendFile("server_list.txt",conn)
                 /*
                 同步服务器列表交互流程：
@@ -446,7 +457,8 @@ func clientHandle(conn net.Conn) {//客户端连接处理goroutine，处理客�
             case SERVER_LOAD:
                 log("[接收到指令]查询服务器负载：",global_server_load)
                 conn.Write([]byte{global_server_load})
-            case 255:
+            case 255://中断连接
+                break
         }
     }
 }
@@ -459,7 +471,6 @@ func clientShell(){//客户端命令行
         var command string
         var parameter [3] string
         fmt.Scanf("%s %s %s %s", &command, &parameter[0], &parameter[1], &parameter[2])
-        //fmt.Printf("%s %s %s %s\n", command, parameter[0], parameter[1], parameter[2])
         switch command {
             case "help"://帮助
                 fmt.Println(CLIENT_SHELL_HELP_MSG)
@@ -477,48 +488,54 @@ func clientShell(){//客户端命令行
                 acquireGlobalLock_Read()
                 db, err := sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
                 //从数据库中读取文件名并新建下载任务
-                rows, err := db.Query(`SELECT num,key,server FROM keys WHERE filename=$1 ORDER BY num`,parameter[0]);checkErr(err)
+                var key_server_pair [] KeyServerPair
+                //查询得到key_list
                 var key_list [] string
-                var server_key_pair [] ServerKeyPair
+                rows, err := db.Query(`SELECT key,num FROM FileKey WHERE filename=$1 ORDER BY num`,parameter[0]);checkErr(err)
                 for rows.Next() {
-                    var key,server string
-                    var num int //这个不会用到
-                    if err = rows.Scan(&num,&key,&server); err != nil {
+                    var key string
+                    var num int
+                    if err = rows.Scan(&key,&num); err != nil {//TODO:优化错误处理
+                        log(err)
                         rows.Close()
                         break
                     }
+                    log(num,key)
                     key_list=append(key_list,key)
-                    server_key_pair=append(server_key_pair,ServerKeyPair{Server:server,Key:key})
+                }
+                //查询每个key对应的服务器列表
+                for n,key := range key_list{
+                    key_server_pair=append(key_server_pair,KeyServerPair{Key:key})
+                    rows, err := db.Query(`SELECT server FROM KeyServer WHERE key=$1 ORDER BY server`,key);checkErr(err)
+                    for rows.Next() {
+                        var server string
+                        if err = rows.Scan(&server); err != nil {
+                            rows.Close()
+                            break
+                        }
+                        key_server_pair[n].Server=append(key_server_pair[n].Server,server)
+                    }
                 }
                 err = db.Close();checkErr(err)
                 releaseGlobalLock_Read()
-                //key去重
-                key_list=RemoveDuplicatesAndEmpty(key_list)
                 //提交下载任务
                 //难点：实现智能选择服务器，多线程下载
                 //理想实现：看服务器带宽情况
                 //实际实现：根据服务器连接数进行评分
-                for i,key := range key_list{//遍历出每个key及其对于的服务器，然后选择最佳服务器进行下载
-                    var key_server_list [] string //服务器列表
-                    //遍历出每个key及其对于的服务器
-                    for _,server_key := range server_key_pair{
-                        if server_key.Key==key{
-                            key_server_list=append(key_server_list,server_key.Server)
-                        }
-                    }
+                for i,key_server := range key_server_pair{//每个key选择最佳服务器进行下载
                     //选择最佳服务器
                     best_server_load:=uint8(255)//服务器负载
                     var best_server string
-                    for _,server := range key_server_list{
+                    for _,server := range key_server.Server{
                         server_load:=getServerLoad(server)
                         if server_load<=best_server_load {
                             best_server=server
                             best_server_load=server_load
                         }
                     }
-                    fmt.Println("提交下载任务",i)
+                    fmt.Println("提交下载任务",i,key_server.Key,best_server)
                     download_mission.Add()
-                    go downloadFile(key, best_server)
+                    go downloadFile(key_server.Key, best_server)
                 }
                 //等待下载完毕
                 fmt.Println("等待下载完成……")
@@ -541,7 +558,7 @@ func clientShell(){//客户端命令行
                 db, err := sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
                 //直接从数据库中读取文件名并打印
                 if parameter[0]=="-l" {
-                    rows, err := db.Query(`SELECT * FROM keys`);checkErr(err)
+                    rows, err := db.Query(`SELECT FileKey.filename,FileKey.num,FileKey.key,KeyServer.server FROM FileKey,KeyServer WHERE FileKey.key=KeyServer.key`);checkErr(err)
                     for rows.Next() {
                         var filename,key,server string
                         var num int
@@ -552,7 +569,7 @@ func clientShell(){//客户端命令行
                         fmt.Println(filename,num,key,server)
                     }
                 }else{
-                    rows, err := db.Query(`SELECT DISTINCT filename FROM keys`);checkErr(err)
+                    rows, err := db.Query(`SELECT filename FROM File WHERE deleted=0`);checkErr(err)
                     for rows.Next() {
                         var filename string
                         if err = rows.Scan(&filename); err != nil {
@@ -626,10 +643,10 @@ func clientShell(){//客户端命令行
                     fmt.Println("查找数据库……")
                     acquireGlobalLock_Read()
                     db, err := sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
-                    servers := map[string]int{} //ket为服务器ip，value为服务器上块的数量
+                    servers := map[string]int{} //key为服务器ip，value为服务器上块的数量
                     for _,server := range global_server_list {
                         var num int
-                        rows, err := db.Query(`SELECT * FROM keys WHERE server=$1`,server);checkErr(err)
+                        rows, err := db.Query(`SELECT * FROM KeyServer WHERE server=$1`,server);checkErr(err)//TODO:改用count函数！
                         for rows.Next() {
                             num+=1
                         }
@@ -699,12 +716,14 @@ func clientShell(){//客户端命令行
                     acquireGlobalLock_Write()
                     //写入数据库
                     db, err = sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
-                    //stmt, _ := db.Prepare("INSERT INTO keys VALUES (?,?,?,?)")
-                    //stmt.Exec(filename,i,key,min_key_nums_server)
                     tx, err := db.Begin();checkErr(err)
-                    _, err = tx.Exec(`INSERT INTO keys VALUES ($1,$2,$3,$4);`,filename,i,key,servers_sorted[0].Key);checkErr(err)
+                    if i==0 {
+                        _, err = tx.Exec(`INSERT INTO File VALUES ($1,0);`,filename);checkErr(err)
+                    }
+                    _, err = tx.Exec(`INSERT INTO FileKey VALUES ($1,$2,$3);`,filename,i,key);checkErr(err)
+                    _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,servers_sorted[0].Key);checkErr(err)
                     if(server_upload[1]!=""){
-                        _, err = tx.Exec(`INSERT INTO keys VALUES ($1,$2,$3,$4);`,filename,i,key,servers_sorted[1].Key);checkErr(err)
+                    _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,servers_sorted[1].Key);checkErr(err)
                     }
                     err = tx.Commit();checkErr(err)
                     log("插入数据。",)
@@ -729,20 +748,20 @@ func clientShell(){//客户端命令行
                 acquireGlobalLock_Write()
                 //查询key并删除
                 db, err := sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
-                rows, err := db.Query(`SELECT key,server FROM keys WHERE filename = $1`,parameter[0]);checkErr(err)
+                rows, err := db.Query(`SELECT key FROM FileKey WHERE filename = $1`,parameter[0]);checkErr(err)
                 var key_list [] string
                 for rows.Next() {
-                    var key,server string
-                    if err = rows.Scan(&key,&server); err != nil {
+                    var key string
+                    if err = rows.Scan(&key); err != nil {
                         rows.Close()
                         break
                     }
-                    fmt.Println(key,server)
                     key_list=append(key_list,key)
                 }
                 //db.Exec("DELETE FROM keys WHERE filename = '"+parameter[0]+"'")//删除文件
                 tx, err := db.Begin();checkErr(err)
-                _, err = tx.Exec(`DELETE FROM keys WHERE filename = $1`,parameter[0]);checkErr(err)//删除文件
+                //_, err = tx.Exec(`DELETE FROM keys WHERE filename = $1`,parameter[0]);checkErr(err)//删除文件
+                _, err = tx.Exec(`UPDATE File SET deleted=1 WHERE filename = $1`,parameter[0]);checkErr(err)//删除文件
                 err = tx.Commit();checkErr(err)
                 err = db.Close();checkErr(err)
                 fmt.Println("数据库更新成功。")
@@ -759,6 +778,7 @@ func clientShell(){//客户端命令行
                     sendDatasToAllServers(bytes_buf.Bytes())
                 }
                 fmt.Println("文件删除完毕！")
+                //TODO:清除数据库列表冗余项
         }
     }
 }
@@ -783,25 +803,32 @@ func clientShell(){//客户端命令行
 
 
 
-
+func testConn(){//服务器加入集群时的测试连接函数
+    //打开端口，测试连接
+    tcpAddr, err := net.ResolveTCPAddr("tcp",":"+*port)
+    tcpListener, err := net.ListenTCP("tcp",tcpAddr)
+    if err != nil {
+        fmt.Println("[ERROR]服务器启动错误：",err)
+        panic("服务器启动错误")
+    }
+    //处理服务器测试连接
+    tcpConn, _ := tcpListener.AcceptTCP()
+    tcpConn.Close()
+    fmt.Println("服务器测试连接成功！")
+}
 
 //hashFile利用hash算法将目标文件生成哈希值 https://blog.csdn.net/benben_2015/article/details/80146147
 func hashFile(filePath string) []byte {
     f, err := os.Open(filePath);checkErr(err)
     defer f.Close()
     h := sha1.New()
-    /*if _, err := io.Copy(h, f); err != nil {
-        fmt.Println(err)
-    }*/
     _, err = io.Copy(h, f);checkErr(err)
-    //fmt.Println(hex.EncodeToString(h.Sum(nil)))
     return h.Sum(nil) //长度20Byte
 }
 
 func hashBytes(b []byte) []byte {
     h := sha1.New()
     h.Write(b)
-    //fmt.Println(hex.EncodeToString(h.Sum(nil)))
     return h.Sum(nil) //长度20Byte
 }
 
@@ -840,6 +867,7 @@ func downloadFile(filename string, tcpAddrString string)error{//下载文件
 
 func sendDatasToAllServers(datas []byte){
     for _, server := range global_server_list{
+        if server == self_server_addr {continue}
         tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
         conn, err := net.DialTCP("tcp", nil, tcpAddr)
         if err != nil {
@@ -847,10 +875,8 @@ func sendDatasToAllServers(datas []byte){
             continue
         }
         conn.Write(datas)
-        //fmt.Println("数据发送成功：",datas)
         instruct := make([]byte, 1)
         conn.Read(instruct)
-        //fmt.Println("数据读取成功：",instruct)
         var i byte
         binary.Read(bytes.NewBuffer(instruct), binary.BigEndian, &i)
         for{
@@ -907,23 +933,25 @@ func releaseGlobalLock_Loan(){//释放全局数据库锁(借出)
 }
 
 func syncGlobalDatabase(){
+    log("向其它服务器发送数据库……")
     bytes_buf := bytes.NewBuffer(make([]byte, 0))
     binary.Write(bytes_buf, binary.BigEndian, SYNC_GLOBAL_DB)
     binary.Write(bytes_buf, binary.BigEndian, getFileSize(GLOBAL_DB_PATH))
     file_datas, err := ioutil.ReadFile(GLOBAL_DB_PATH);checkErr(err)
     binary.Write(bytes_buf, binary.BigEndian, file_datas)
     sendDatasToAllServers(bytes_buf.Bytes())
-    fmt.Println("数据库同步成功。")
+    log("数据库同步成功。")
 }
 
 func syncServerList(){
+    log("向其它服务器发送服务器列表……")
     bytes_buf := bytes.NewBuffer(make([]byte, 0))
     binary.Write(bytes_buf, binary.BigEndian, SYNC_SERVER_LIST)
     binary.Write(bytes_buf, binary.BigEndian, getFileSize("server_list.txt"))
     file_datas, err := ioutil.ReadFile("server_list.txt");checkErr(err)
     binary.Write(bytes_buf, binary.BigEndian, file_datas)
     sendDatasToAllServers(bytes_buf.Bytes())
-    fmt.Println("数据库同步成功。")
+    log("服务器列表同步成功。")
 }
 
 func log(v ... interface{}){
@@ -945,6 +973,7 @@ func refreshServerList(){//刷新服务器列表
 
 func reciveFile(file_path string, conn net.Conn)error{
     time_start:=time.Now()
+    //time.Sleep(time.Millisecond * 200)//以防接不到数据
     data := make([]byte, 8)
     conn.Read(data)
     var file_size uint64
@@ -977,13 +1006,10 @@ func sendFile(file_path string, conn net.Conn){
     time_start:=time.Now()
     bytes_buf := bytes.NewBuffer(make([]byte, 0))
     file_size:=getFileSize(file_path)
-    //binary.Write(bytes_buf, binary.BigEndian, FILE_SIZE)//1字节指令码
     binary.Write(bytes_buf, binary.BigEndian, file_size)//8字节文件大小（uint64）
     conn.Write(bytes_buf.Bytes())
-    //发送文件 TODO：对大文件的优化。目前是全部读进内存。
+    //发送文件
     log("开始发送文件……")
-    //file_datas, err := ioutil.ReadFile(file_path);checkErr(err)
-    //conn.Write(file_datas)
     f,err:=os.Open(file_path);checkErr(err)
     defer f.Close()
     buf := make([]byte, FILE_READ_SIZE)
@@ -1013,18 +1039,6 @@ func readInstruct(conn net.Conn)byte{
         fmt.Println("[ERROR]读取指令出错：",err)
         return 255
     }
-    /*for {
-        n, err := conn.Read(instruct) //从conn中读取数据，n为数据大小
-        if err != nil && err.Error() != "EOF" {
-            fmt.Println("[ERROR]读取指令出错：",err)
-            return 255
-            //panic("读取指令出错")
-        }
-        if n!=0 {
-            break
-        }
-        time.Sleep(time.Millisecond*10)
-    }*/
     return instruct[0]
 }
 
@@ -1072,6 +1086,8 @@ func uploadFile(key string,conn net.Conn){
     instruct:=readInstruct(conn)//等待服务端回应ACK
     if instruct==ACK {
         fmt.Println("上传成功：",key)
+    }else{
+        fmt.Println("[ERROR]上传失败：",key)//TODO:处理失败情形
     }
     conn.Close()
     upload_mission.Done()
@@ -1096,15 +1112,10 @@ func writeAll(c net.Conn, b []byte)error{
 
 
 
-type ServerKeyPair struct {//服务器-key对
-    Server   string
+type KeyServerPair struct {//Key-服务器对
     Key string
+    Server []string
 }
-
-
-
-
-
 
 //要对golang map按照value进行排序，思路是直接不用map，用struct存放key和value，实现sort接口，就可以调用sort.Sort进行排序了。
 // A data structure to hold a key/value pair.
