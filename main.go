@@ -36,6 +36,7 @@ const ( //定义指令码，数据包第一个字节为指令码
     UPLOAD_FILE byte = 10 //上传文件指令，后面跟文件的key+文件大小+文件内容
     DELETE_FILE byte = 11 //删除文件指令，后面跟文件的key
     SEND_GLOBAL_DB byte = 12 //发送全局数据库指令
+    SEND_GLOBAL_DB_FORCE byte = 2 //强制发送全局数据库指令（不需要取得全局数据库锁）
     JOIN_CLUSTER byte = 13 //加入集群指令，后面跟服务器端口（uint16）
     GET_SERVER_LIST byte = 14 //下载服务器列表
     SYNC_SERVER_LIST byte = 15 //同步服务器列表
@@ -50,6 +51,7 @@ const CLIENT_SHELL_HELP_MSG= //客户端命令行帮助信息
     get [filename]：下载文件
     put [filename]：上传文件
     del [filename]：删除文件
+    update：更新数据库（客户端启动时也会自动更新）
     exit：退出
     `
 
@@ -66,37 +68,24 @@ const (
 节点写入完成后，将数据库同步给所有节点
 同步完成后释放分布式锁
 如果要读取数据，需要在没有节点写入数据库的时候读取（如果读取时有节点要申请锁，读取完再给）
-
-TODO：删除文件时看看如何清理数据库，文件块下载完成进行校验，断点续传，迁移等功能，相同hash的分块不需要上传/重复删除等
-TABEL key_server
-(
-key char(40),//key，即文件分块名，sha1字符串形式，共40字节
-server varchar(255) //文件分块所在的服务器
-)
-
-TABEL file_key
-(
-filename varchar(255),//文件名
-num int(4),//文件分块号，从0开始
-key char(40),//key，即文件分块名，sha1字符串形式，共40字节
-)
-
-TABLE file
-(
-filename varchar(255),//文件名
-//hash varchar(255),//文件hash，非必须
-deleted bool //文件是否已被删除
-)
 */
-
-//TODO:美化输出
 
 /*
-TODO：高可用
-掉线服务器数据同步问题：建立长连接，发现自己掉线，重连后更新数据库和服务器列表。
+数据库结构：
+TABEL key_server(
+    key char(40),//key，即文件分块名，sha1字符串形式，共40字节
+    server varchar(255) //文件分块所在的服务器
+)
+TABEL file_key(
+    filename varchar(255),//文件名
+    num int(4),//文件分块号，从0开始
+    key char(40),//key，即文件分块名，sha1字符串形式，共40字节
+)
 */
 
-//var download_mission sync.WaitGroup //下载任务的WaitGroup
+//TODO：文件块下载完成进行校验，断点续传，迁移等功能，相同hash的分块不需要上传/重复删除等，美化输出
+
+
 var download_mission=sizedwaitgroup.New(2) //最大同时下载任务为2
 var upload_mission sync.WaitGroup //上传任务的WaitGroup
 var global_server_list [] string //服务器列表，格式如“127.0.0.1::2333”
@@ -236,10 +225,6 @@ func main() {
         num int,
         key string,
         );`);checkErr(err)
-        _, err = tx.Exec(`CREATE TABLE File (
-        filename string,
-        deleted int,
-        );`);checkErr(err)
         err = tx.Commit();checkErr(err)
         err = db.Close();checkErr(err)
         fmt.Println("[INFO]数据库新建完成。")
@@ -255,10 +240,19 @@ func main() {
         for _,f := range dir {
             //先查询数据库有没有该条目
             var key string
-            //log(f.Name())
+            db.QueryRow(`SELECT key FROM FileKey WHERE key = $1`,f.Name()).Scan(&key);
+            if key=="" {//如果文件里没有这个块，就删除本地块
+                log("发现废弃数据块。")
+                err := os.Remove("storage/"+f.Name())
+                if err==nil {
+                    log("数据块删除成功：",f.Name())
+                }else{
+                    log("数据块删除失败：",f.Name(),err)
+                }
+                continue
+            }
             db.QueryRow(`SELECT key FROM KeyServer WHERE server = $1 and key = $2`,self_server_addr,f.Name()).Scan(&key);
-            //fmt.Println(f.Name(),key)
-            if key=="" {//如果没有就新增 TODO:根据文件情况决定是否删除
+            if key=="" {//如果文件里有，但数据库KeyServer没有这个服务器条目，就新增数据条目
                 log("新增数据块：",f.Name())
                 tx, err := db.Begin();checkErr(err)
                 _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,f.Name(),self_server_addr);checkErr(err)
@@ -401,6 +395,9 @@ func clientHandle(conn net.Conn) {//客户端连接处理goroutine，处理客�
                 客户端关闭连接
                 服务端关闭连接
                 */
+            case SEND_GLOBAL_DB_FORCE://不理会全局数据库锁强行发送数据库
+                log("[接收到指令]强制发送全局数据库")
+                sendFile(GLOBAL_DB_PATH,conn)
             case JOIN_CLUSTER:
                 /*
                 加入集群交互流程：
@@ -522,16 +519,20 @@ func clientShell(){//客户端命令行
                 //难点：实现智能选择服务器，多线程下载
                 //理想实现：看服务器带宽情况
                 //实际实现：根据服务器连接数进行评分
+                var best_server string
                 for i,key_server := range key_server_pair{//每个key选择最佳服务器进行下载
                     //选择最佳服务器
                     best_server_load:=uint8(255)//服务器负载
-                    var best_server string
                     for _,server := range key_server.Server{
                         server_load:=getServerLoad(server)
                         if server_load<=best_server_load {
                             best_server=server
                             best_server_load=server_load
                         }
+                    }
+                    if best_server_load==255 {
+                        fmt.Println("[ERROR]部分文件块所在服务器不在线，文件无法下载。")
+                        os.Exit(1)
                     }
                     fmt.Println("提交下载任务",i,key_server.Key,best_server)
                     download_mission.Add()
@@ -569,7 +570,7 @@ func clientShell(){//客户端命令行
                         fmt.Println(filename,num,key,server)
                     }
                 }else{
-                    rows, err := db.Query(`SELECT filename FROM File WHERE deleted=0`);checkErr(err)
+                    rows, err := db.Query(`SELECT distinct(filename) FROM FileKey`);checkErr(err)
                     for rows.Next() {
                         var filename string
                         if err = rows.Scan(&filename); err != nil {
@@ -646,10 +647,7 @@ func clientShell(){//客户端命令行
                     servers := map[string]int{} //key为服务器ip，value为服务器上块的数量
                     for _,server := range global_server_list {
                         var num int
-                        rows, err := db.Query(`SELECT * FROM KeyServer WHERE server=$1`,server);checkErr(err)//TODO:改用count函数！
-                        for rows.Next() {
-                            num+=1
-                        }
+                        err := db.QueryRow(`SELECT count(*) FROM KeyServer WHERE server=$1`,server).Scan(&num);checkErr(err)
                         servers[server]=num
                         fmt.Println(server,num)
                     }
@@ -717,9 +715,6 @@ func clientShell(){//客户端命令行
                     //写入数据库
                     db, err = sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
                     tx, err := db.Begin();checkErr(err)
-                    if i==0 {
-                        _, err = tx.Exec(`INSERT INTO File VALUES ($1,0);`,filename);checkErr(err)
-                    }
                     _, err = tx.Exec(`INSERT INTO FileKey VALUES ($1,$2,$3);`,filename,i,key);checkErr(err)
                     _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,servers_sorted[0].Key);checkErr(err)
                     if(server_upload[1]!=""){
@@ -758,10 +753,13 @@ func clientShell(){//客户端命令行
                     }
                     key_list=append(key_list,key)
                 }
-                //db.Exec("DELETE FROM keys WHERE filename = '"+parameter[0]+"'")//删除文件
                 tx, err := db.Begin();checkErr(err)
-                //_, err = tx.Exec(`DELETE FROM keys WHERE filename = $1`,parameter[0]);checkErr(err)//删除文件
-                _, err = tx.Exec(`UPDATE File SET deleted=1 WHERE filename = $1`,parameter[0]);checkErr(err)//删除文件
+                //先从KeyServer处删除key
+                for _,key := range key_list {
+                    _, err = tx.Exec(`DELETE FROM KeyServer WHERE key = $1`,key);checkErr(err)//删除文件
+                }
+                //然后从FileKey中删除file
+                _, err = tx.Exec(`DELETE FROM FileKey WHERE filename = $1`,parameter[0]);checkErr(err)//删除文件
                 err = tx.Commit();checkErr(err)
                 err = db.Close();checkErr(err)
                 fmt.Println("数据库更新成功。")
@@ -769,7 +767,7 @@ func clientShell(){//客户端命令行
                 syncGlobalDatabase()
                 //归还全局数据库锁
                 releaseGlobalLock_Write()
-                //通知对应的服务器删除文件块 TODO:待优化，只通知存在的服务器删除，通知失败则留着上线删除
+                //通知对应的服务器删除文件块 TODO:待优化，只通知存在的服务器删除
                 log("通知服务器删除文件……")
                 for _,key := range key_list {
                     bytes_buf := bytes.NewBuffer(make([]byte, 0))
@@ -778,7 +776,8 @@ func clientShell(){//客户端命令行
                     sendDatasToAllServers(bytes_buf.Bytes())
                 }
                 fmt.Println("文件删除完毕！")
-                //TODO:清除数据库列表冗余项
+            case "update":
+                getGlobalDatabase(false)
         }
     }
 }
@@ -898,6 +897,7 @@ func acquireGlobalLock_Write(){//请求全局数据库锁
             break
         }
     }
+    getGlobalDatabase(true)//获得锁后会进行写入，写入前先更新全局数据库
 }
 
 func releaseGlobalLock_Write(){//释放全局数据库锁
@@ -1107,7 +1107,30 @@ func writeAll(c net.Conn, b []byte)error{
     return nil
 }
 
-
+func getGlobalDatabase(force bool){
+    log("获取最新全局数据库……")
+    for _,server:= range global_server_list {
+        tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
+        conn, err := net.DialTCP("tcp", nil, tcpAddr)
+        if err!=nil {continue}
+        fmt.Println("服务器连接成功：",server)
+        if force==true {
+            sendInstruct(SEND_GLOBAL_DB_FORCE,conn)
+        }else{
+            sendInstruct(SEND_GLOBAL_DB,conn)
+        }
+        err=reciveFile(GLOBAL_DB_PATH,conn)//下载文件
+        if err!=nil {
+            fmt.Println("[ERROR]全局数据库下载失败")
+            os.Exit(1)
+        }
+        //关闭连接并退出循环
+        conn.Close()
+        return
+    }
+    fmt.Println("[ERROR]全局数据库下载失败：没有可用的服务器。")
+    os.Exit(1)
+}
 
 
 
