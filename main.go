@@ -61,6 +61,7 @@ const (
     DB_TYPE="ql2" //数据库类型
     GLOBAL_DB_PATH="global.db" //数据库路径
 )
+const NET_TIMEOUT=time.Millisecond*300
 
 /*
 数据库同步方案：
@@ -147,8 +148,7 @@ func main() {
         fmt.Println("[INFO]连接服务器……")
         var connected_server string
         for _,server:= range global_server_list {
-            tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
-            conn, err := net.DialTCP("tcp", nil, tcpAddr)
+            conn, err := net.DialTimeout("tcp", server, NET_TIMEOUT)
             if err!=nil {continue}
             fmt.Println("服务器连接成功：",server)
             connected_server=server
@@ -197,8 +197,7 @@ func main() {
 
         time.Sleep(time.Millisecond*100)//不等待的话会卡住，不过不是很懂为什么
         fmt.Println("[INFO]更新服务器列表……")
-        tcpAddr, err := net.ResolveTCPAddr("tcp", connected_server);checkErr(err)
-        conn, err := net.DialTCP("tcp", nil, tcpAddr)
+        conn, err := net.DialTimeout("tcp", connected_server, NET_TIMEOUT)
         if err != nil {
             fmt.Println("[ERROR]更新服务器列表失败，请检查网络连接！")
             os.Exit(1)
@@ -415,8 +414,7 @@ func clientHandle(conn net.Conn) {//客户端连接处理goroutine，处理客�
                 binary.Read(bytes.NewBuffer(data), binary.BigEndian, &server_port)
                 server:=strings.Split(conn.RemoteAddr().String(),":")[0]+":"+strconv.Itoa(int(server_port))
                 //建立测试连接
-                test_tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
-                test_conn, err := net.DialTCP("tcp", nil, test_tcpAddr)
+                test_conn, err := net.DialTimeout("tcp", server, NET_TIMEOUT)
                 if err != nil {
                     //test_conn.Close()
                     fmt.Println("测试连接失败")
@@ -662,10 +660,9 @@ func clientShell(){//客户端命令行
                     server_upload:=make([]string,2)
                     server_upload_point:=0;
                     for{//上传第一个副本
-                        tcpAddr, err := net.ResolveTCPAddr("tcp", servers_sorted[server_upload_point].Key);checkErr(err)
-                        conn, err := net.DialTCP("tcp", nil, tcpAddr)
+                        conn, err := net.DialTimeout("tcp", servers_sorted[server_upload_point].Key, NET_TIMEOUT)
                         if err != nil {
-                            fmt.Println("服务器连接失败：",tcpAddr)
+                            fmt.Println("服务器连接失败：",servers_sorted[server_upload_point].Key)
                             if(server_upload_point>=servers_sorted.Len()){
                                 fmt.Println("[ERROR]所有服务器连接失败，没有可上传的服务器！")
                                 os.Exit(1)
@@ -685,10 +682,9 @@ func clientShell(){//客户端命令行
                             fmt.Println("[WARN]只连上一个服务器，该文件分块没有多副本！")
                             break
                         }
-                        tcpAddr, err := net.ResolveTCPAddr("tcp", servers_sorted[server_upload_point].Key);checkErr(err)
-                        conn, err := net.DialTCP("tcp", nil, tcpAddr)
+                        conn, err := net.DialTimeout("tcp", servers_sorted[server_upload_point].Key, NET_TIMEOUT)
                         if err != nil {
-                            fmt.Println("服务器连接失败：",tcpAddr)
+                            fmt.Println("服务器连接失败：",servers_sorted[server_upload_point].Key)
                             if(server_upload_point>=servers_sorted.Len()){
                                 fmt.Println("[WARN]只连上一个服务器，该文件分块没有多副本！")
                                 break
@@ -716,9 +712,9 @@ func clientShell(){//客户端命令行
                     db, err = sql.Open(DB_TYPE, GLOBAL_DB_PATH);checkErr(err)//连接全局数据库
                     tx, err := db.Begin();checkErr(err)
                     _, err = tx.Exec(`INSERT INTO FileKey VALUES ($1,$2,$3);`,filename,i,key);checkErr(err)
-                    _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,servers_sorted[0].Key);checkErr(err)
+                    _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,server_upload[0]);checkErr(err)
                     if(server_upload[1]!=""){
-                    _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,servers_sorted[1].Key);checkErr(err)
+                        _, err = tx.Exec(`INSERT INTO KeyServer VALUES ($1,$2);`,key,server_upload[1]);checkErr(err)
                     }
                     err = tx.Commit();checkErr(err)
                     log("插入数据。",)
@@ -843,8 +839,7 @@ func getFileSize(filepath string) uint64 {//读取文件大小
 
 func downloadFile(filename string, tcpAddrString string)error{//下载文件
     //连接服务器
-    tcpAddr, err := net.ResolveTCPAddr("tcp", tcpAddrString);checkErr(err)
-    conn, err := net.DialTCP("tcp", nil, tcpAddr)
+    conn, err := net.DialTimeout("tcp", tcpAddrString, NET_TIMEOUT)
     if err != nil {
         fmt.Println("服务器连接失败")
         return errors.New("服务器连接失败")
@@ -867,10 +862,9 @@ func downloadFile(filename string, tcpAddrString string)error{//下载文件
 func sendDatasToAllServers(datas []byte){
     for _, server := range global_server_list{
         if server == self_server_addr {continue}
-        tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
-        conn, err := net.DialTCP("tcp", nil, tcpAddr)
+        conn, err := net.DialTimeout("tcp", server, NET_TIMEOUT)
         if err != nil {
-            fmt.Println("服务器连接失败：",tcpAddr)
+            fmt.Println("服务器连接失败：",server)
             continue
         }
         conn.Write(datas)
@@ -1066,10 +1060,9 @@ func isPathExists(path string)bool{
 }
 
 func getServerLoad(server string)uint8{//获取服务器负载
-    tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
-    conn, err := net.DialTCP("tcp", nil, tcpAddr)
+    conn, err := net.DialTimeout("tcp", server, NET_TIMEOUT)
     if err != nil {
-        fmt.Println("服务器连接失败：",tcpAddr)
+        fmt.Println("服务器连接失败：",server)
         return 255
     }
     conn.Write([]byte{SERVER_LOAD})
@@ -1110,8 +1103,7 @@ func writeAll(c net.Conn, b []byte)error{
 func getGlobalDatabase(force bool){
     log("获取最新全局数据库……")
     for _,server:= range global_server_list {
-        tcpAddr, err := net.ResolveTCPAddr("tcp", server);checkErr(err)
-        conn, err := net.DialTCP("tcp", nil, tcpAddr)
+        conn, err := net.DialTimeout("tcp", server, NET_TIMEOUT)
         if err!=nil {continue}
         fmt.Println("服务器连接成功：",server)
         if force==true {
