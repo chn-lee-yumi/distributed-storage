@@ -61,8 +61,6 @@ const CLIENT_SHELL_HELP_MSG= //客户端命令行帮助信息
     del [filename]：删除文件
     update：更新数据库（客户端启动时也会自动更新）
     status：服务器状态
-    debug [number]：调试命令
-        1：强制归还数据库锁
     exit：退出
     `
 
@@ -631,7 +629,7 @@ func clientShell(){//客户端命令行
                 download_mission.Wait()
                 //合并文件
                 fmt.Println("合并文件块……")
-                file_full, _ := os.Create("download/"+parameter[0])
+                file_full, _ := os.Create("download/"+parameter[1])
                 for _,key := range key_list {
                     file_piece, err := os.Open("tmp/"+key);checkErr(err)
                     buf:=make([]byte, getFileSize("tmp/"+key))
