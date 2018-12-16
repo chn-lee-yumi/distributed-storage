@@ -7,7 +7,7 @@
 //TODO：退出集群、数据库冗余项的清理、服务器列表废弃服务器的清理
 //TODO：文件块下载完成进行校验，断点续传，迁移等功能，相同hash的分块不需要上传/重复删除等，美化输出
 
-package dss
+package main
 
 import (
     "fmt"

@@ -8,26 +8,31 @@
 - ~~能够适应校园网是动态IP的问题，服务器启动后会扫描本地存储块并更新到全局数据库中。~~(新版本丢失了此特性，待修复)
 - 理论上可以实现一个节点掉线后重新创建副本，下载上传可以实现断电续传。这些特性留待以后看心情实现。
 - 关于这个分布式存储为什么选择go语言，因为我觉得go语言最合适。我考虑过python和c，python不能编译成二进制文件，不方便移植，而c编写太复杂，不想折腾。然后想起之前面试时面试官提过go语言，我就查了下，觉得特别合适，而且交叉编译十分方便，于是便边学go变写这个系统。
-- 系统的难点也挺多的，比如全局数据库的一致性、系统高可用的实现等等。不过也勉强能解决。在网络理想的状态下是没什么问题的。这个系统还有一个小概率会出现的问题，就是当多个客户端同时写入数据库时，可能会出现死锁。因为我为全局数据库设置了一个写入锁，客户端要写入时需要向所有服务器申请锁，如果两个客户端同时申请，就可能出现死锁。这个问题留待后面看心情解决。
+- 系统的难点也挺多的，比如全局数据库的一致性、系统高可用的实现、上传下载时最佳服务器的选择等等。
 - 最近在了解fuse，如果可以的话，我打算尝试一下用这个系统接入fuse。
 
 ## 编译
 
-- 下载代码（把代码下载到GOPATH的src目录下，并重命名文件夹名字为dss）
-```shell
-cd $GOPATH/src
-git clone https://github.com/chn-lee-yumi/distributed-storage.git --depth=1
-mv distributed-storage dss
-```
-- 第一次编译需要安装依赖
+- 先安装依赖
 ```shell
 go get -tags purego modernc.org/ql
 go get github.com/remeh/sizedwaitgroup
 ```
-- 以后编译只要执行下面的命令。
+
+- 下载代码和编译
 ```shell
-go build dss
+cd $GOPATH/src # 切换到GOPATH的src目录
+git clone https://github.com/chn-lee-yumi/distributed-storage.git --depth=1 # 下载代码
+mv distributed-storage dss # 重命名文件夹名字为dss
+cd dss # 进入代码文件夹
+go build # 编译项目，生成名为dss的可执行文件
 ```
+
+- 在任何目录下编译
+```shell
+go build dss # 编译项目，在当前路径下生成名为dss的可执行文件
+```
+
 - 交叉编译：
 ```shell
 # shell

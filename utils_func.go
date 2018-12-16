@@ -1,4 +1,4 @@
-package dss
+package main
 
 /*
 本文件包含了一些杂七杂八的实用函数，方便打码

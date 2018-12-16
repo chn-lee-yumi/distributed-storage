@@ -1,4 +1,4 @@
-package dss
+package main
 
 /*
 本文件包含了数据库相关的函数

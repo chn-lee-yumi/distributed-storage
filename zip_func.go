@@ -1,4 +1,4 @@
-package dss
+package main
 
 /*
 本文件包含了封装好的压缩函数，用于压缩和解压缩文件。这些函数会在db_func.go里面被再次封装。

@@ -1,4 +1,4 @@
-package dss
+package main
 
 /*
 本文件包含了集群连接相关的函数
