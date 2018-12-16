@@ -1,3 +1,0 @@
-模拟三台服务器集群：
-将文件夹复制4分，其中三份分别运行run_first_server.bat（需先运行，作为首个服务器），run_server_2.bat,run_server_3.bat。剩下一份运行客户端（直接双击project.exe）。
-然后可以在客户端用upload命令上传文件，ls查看，ls -l查看详细信息，get下载文件，delete删除文件。
