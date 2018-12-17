@@ -58,8 +58,8 @@ const CLIENT_SHELL_HELP_MSG= //客户端命令行帮助信息
     ls：查看可下载的文件列表
         使用-l参数可以查看可下载的文件及其分块、分块所在的服务器
     login [username]：登录，使用get命令和del命令时需要
-    get [filename]：下载文件
-    put [username] [filename]：上传文件
+    get [username] [filename]：下载文件
+    put [filename]：上传文件
     del [filename]：删除文件
     update：更新数据库（客户端启动时也会自动更新）
     status：服务器状态
